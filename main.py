@@ -9,8 +9,9 @@ import rawpy
 import numpy as np
 from PIL import Image
 from typing import List
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Query
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
 from sqlalchemy.orm import Session as DBSession
@@ -29,6 +30,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="ATTONE", version="0.1.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 RAW_EXTENSIONS = {".cr2", ".cr3", ".arw", ".nef", ".nrw", ".dng", ".raf", ".orf", ".rw2"}
 IMG_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp"}
@@ -192,7 +200,25 @@ def session_progress(session_id: int):
     return {"session_id": session_id, **prog}
 
 
+BROWSE_ALLOWED_ROOTS = [
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "test_images")),
+    "/home/runner/workspace",
+]
+
+
+@app.get("/browse")
+def browse_directory(path: str = Query(...)):
+    target = os.path.abspath(path)
+    if not any(target.startswith(root) for root in BROWSE_ALLOWED_ROOTS):
+        raise HTTPException(status_code=403, detail="Path outside allowed roots")
+    if not os.path.isdir(target):
+        raise HTTPException(status_code=404, detail="Directory not found: %s" % path)
+    entries = os.listdir(target)
+    files = sorted([e for e in entries if os.path.isfile(os.path.join(target, e))])
+    directories = sorted([e for e in entries if os.path.isdir(os.path.join(target, e))])
+    return {"path": target, "files": files, "directories": directories}
+
+
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
