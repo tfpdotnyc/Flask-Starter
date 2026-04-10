@@ -8,10 +8,14 @@ import io
 import rawpy
 import numpy as np
 from PIL import Image
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from typing import List
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
-from database import init_db
+from pydantic import BaseModel
+from sqlalchemy.orm import Session as DBSession
+from database import init_db, get_db
+from control_set_manager import ControlSetManager
 
 
 @asynccontextmanager
@@ -72,6 +76,40 @@ async def decode(file: UploadFile = File(...)):
         "height": h,
         "format": fmt,
     }
+
+
+class ControlSetCreate(BaseModel):
+    name: str
+    description: str | None = None
+    image_paths: List[str]
+
+
+@app.post("/control-sets")
+def create_control_set(payload: ControlSetCreate, db: DBSession = Depends(get_db)):
+    for p in payload.image_paths:
+        if not os.path.isfile(p):
+            raise HTTPException(status_code=400, detail="File not found: %s" % p)
+
+    try:
+        result = ControlSetManager.analyze(payload.image_paths)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail="Analysis failed: %s" % str(e))
+
+    cs = ControlSetManager.save(db, payload.name, result, description=payload.description)
+    return ControlSetManager.load(db, cs_id=cs.id)
+
+
+@app.get("/control-sets")
+def list_control_sets(db: DBSession = Depends(get_db)):
+    return ControlSetManager.list_all(db)
+
+
+@app.get("/control-sets/{cs_id}")
+def get_control_set(cs_id: int, db: DBSession = Depends(get_db)):
+    data = ControlSetManager.load(db, cs_id=cs_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="Control set not found")
+    return data
 
 
 if __name__ == "__main__":
