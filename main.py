@@ -14,8 +14,12 @@ from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
 from sqlalchemy.orm import Session as DBSession
-from database import init_db, get_db
+from fastapi import BackgroundTasks
+from database import init_db, get_db, Session as SessionModel, ControlSet
 from control_set_manager import ControlSetManager
+from job_runner import run_session, get_progress
+from face_guard import detect_face
+from background_normalizer import extract_bg_profile
 
 
 @asynccontextmanager
@@ -110,6 +114,82 @@ def get_control_set(cs_id: int, db: DBSession = Depends(get_db)):
     if data is None:
         raise HTTPException(status_code=404, detail="Control set not found")
     return data
+
+
+class SessionCreate(BaseModel):
+    name: str
+    control_set_id: int
+    image_paths: List[str]
+    quality: int = 95
+
+
+@app.post("/sessions")
+def create_session(
+    payload: SessionCreate,
+    background_tasks: BackgroundTasks,
+    db: DBSession = Depends(get_db),
+):
+    cs = db.query(ControlSet).filter(ControlSet.id == payload.control_set_id).first()
+    if not cs:
+        raise HTTPException(status_code=404, detail="Control set not found")
+
+    for p in payload.image_paths:
+        if not os.path.isfile(p):
+            raise HTTPException(status_code=400, detail="File not found: %s" % p)
+
+    control_profile = cs.profile_data
+
+    sess = SessionModel(
+        name=payload.name,
+        control_set_id=payload.control_set_id,
+        total_images=len(payload.image_paths),
+    )
+    db.add(sess)
+    db.commit()
+    db.refresh(sess)
+
+    control_bg = None
+    if cs.source_dir:
+        try:
+            ctrl_img = Image.open(os.path.join(cs.source_dir, os.listdir(cs.source_dir)[0])).convert("RGB")
+            ctrl_face = detect_face(os.path.join(cs.source_dir, os.listdir(cs.source_dir)[0]))
+            if ctrl_face.get("detected"):
+                control_bg = extract_bg_profile(ctrl_img, ctrl_face["primary_face"]["bounding_box"])
+        except Exception:
+            pass
+
+    background_tasks.add_task(
+        run_session,
+        sess.id,
+        payload.image_paths,
+        control_profile,
+        control_bg_profile=control_bg,
+        quality=payload.quality,
+    )
+
+    return {
+        "session_id": sess.id,
+        "name": sess.name,
+        "status": "queued",
+        "total_images": len(payload.image_paths),
+    }
+
+
+@app.get("/sessions/{session_id}/progress")
+def session_progress(session_id: int):
+    prog = get_progress(session_id)
+    if prog is None:
+        return {
+            "session_id": session_id,
+            "phase": "not_started",
+            "total": 0,
+            "processed": 0,
+            "exported": 0,
+            "flagged": 0,
+            "failed": 0,
+            "current_image": None,
+        }
+    return {"session_id": session_id, **prog}
 
 
 if __name__ == "__main__":
