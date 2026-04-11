@@ -1,18 +1,52 @@
 """
 ATTONE — Color Profile Extractor
-Extracts a tonal profile dictionary from any image (JPG or decoded RAW).
+Extracts a tonal profile dictionary from any image (JPG, PNG, TIFF, or RAW).
 This is the measurement core: control images and submission images both
 run through this function. The delta between their outputs drives correction.
 """
 
+import os
 import cv2
 import numpy as np
 
+RAW_EXTENSIONS = {".cr2", ".cr3", ".arw", ".nef", ".nrw", ".dng", ".raf", ".orf", ".rw2"}
 
-def extract_profile(image_path: str) -> dict:
+
+def _read_image_bgr(image_path: str) -> np.ndarray:
+    ext = os.path.splitext(image_path)[1].lower()
+
+    if ext in RAW_EXTENSIONS:
+        try:
+            import rawpy
+        except ImportError:
+            raise RuntimeError(
+                "RAW file detected (%s) but rawpy is not installed. "
+                "Install rawpy to process RAW camera files." % ext.upper()
+            )
+        try:
+            with rawpy.imread(image_path) as raw:
+                rgb = raw.postprocess(use_camera_wb=True, output_bps=8)
+            return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to decode RAW file '%s' (%s): %s"
+                % (os.path.basename(image_path), ext.upper(), str(e))
+            )
+
     bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
     if bgr is None:
-        raise FileNotFoundError(f"Could not read image: {image_path}")
+        supported = "JPG, PNG, TIFF, or RAW (%s)" % ", ".join(
+            sorted(e.upper() for e in RAW_EXTENSIONS)
+        )
+        raise FileNotFoundError(
+            "Could not read '%s'. The file may be corrupted or in an unsupported format. "
+            "Supported formats: %s" % (os.path.basename(image_path), supported)
+        )
+    return bgr
+
+
+def extract_profile(image_path: str) -> dict:
+    bgr = _read_image_bgr(image_path)
 
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
