@@ -1,180 +1,245 @@
 """
-ATTONE — Master Correction Pipeline
-Assembles all modules into a single function: one image in, one corrected image out.
-decode → detect_face → apply_correction → skin_guard → normalize_background → return
+ATTONE | correction_pipeline.py  (AMD-01 rewrite)
+Master correction pipeline — orchestrates all processing stages.
+AMD-01: Bbox masking removed. Now uses four-stage face pipeline
+with soft, feathered, mesh-derived alpha masks.
 
-Never raises exceptions. All errors are caught and returned as {status: "ERROR"}.
+HARD LOCK: No cropped face ROI may ever be directly written back
+into the final image. All face-region edits projected through soft
+mesh-derived alpha masks with feathered transitions.
 """
-
-import time
-import cv2
 import numpy as np
+import cv2
+from pathlib import Path
 from PIL import Image
-from color_profile import extract_profile
-from correction import apply_correction
-from face_guard import detect_face
-from skin_tone_guard import apply_with_skin_guard
-from background_normalizer import extract_bg_profile, normalize_background
+
+from vision.face_pipeline        import run_face_pipeline
+from correction.blend             import feather_blend
+from correction.skin_guard        import apply_skin_guard
+from correction.background_normalizer import normalize_background
+from storage.face_cache           import save_mask_cache, delete_cache
+
+
+def decode_image_to_rgb(image_path: str) -> np.ndarray:
+    ext = Path(image_path).suffix.lower()
+    if ext in [".cr2", ".cr3", ".arw", ".nef", ".nrw"]:
+        import rawpy
+        with rawpy.imread(str(image_path)) as raw:
+            return raw.postprocess(use_camera_wb=True, output_bps=8)
+    else:
+        return np.array(Image.open(image_path).convert("RGB"))
+
+
+def apply_global_correction(
+    img_rgb: np.ndarray,
+    cluster_delta: dict
+) -> np.ndarray:
+    """
+    Apply cluster-level color correction to the full image.
+    Accepts both legacy delta keys (from compute_delta) and AMD-01 keys.
+    No face-region logic here — global canvas only.
+    """
+    if not cluster_delta:
+        return img_rgb
+
+    lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+
+    l_ch = lab[:, :, 0]
+    a_ch = lab[:, :, 1]
+    b_ch = lab[:, :, 2]
+    s_ch = hsv[:, :, 1]
+
+    if "luminance_mean" in cluster_delta:
+        l_ch += cluster_delta["luminance_mean"]
+    elif "exposure" in cluster_delta:
+        l_ch += cluster_delta["exposure"] * 10
+
+    if "contrast_std" in cluster_delta and cluster_delta["contrast_std"] != 0:
+        l_mean = np.mean(l_ch)
+        factor = 1.0 + (cluster_delta["contrast_std"] / 100.0)
+        l_ch[:] = l_mean + (l_ch - l_mean) * factor
+
+    if "shadow_5pct" in cluster_delta:
+        shadow_mask = (l_ch < 50).astype(np.float32)
+        l_ch += cluster_delta["shadow_5pct"] * shadow_mask
+
+    if "highlight_95pct" in cluster_delta:
+        highlight_mask = (l_ch > 200).astype(np.float32)
+        l_ch += cluster_delta["highlight_95pct"] * highlight_mask
+
+    if "blacks_1pct" in cluster_delta:
+        blacks_mask = (l_ch < 20).astype(np.float32)
+        l_ch += cluster_delta["blacks_1pct"] * blacks_mask
+
+    if "whites_99pct" in cluster_delta:
+        whites_mask = (l_ch > 230).astype(np.float32)
+        l_ch += cluster_delta["whites_99pct"] * whites_mask
+
+    if "a_mean" in cluster_delta:
+        a_ch += cluster_delta["a_mean"]
+
+    if "b_mean" in cluster_delta:
+        b_ch += cluster_delta["b_mean"]
+
+    if "saturation_mean" in cluster_delta and cluster_delta["saturation_mean"] != 0:
+        s_ch += cluster_delta["saturation_mean"]
+    elif "saturation" in cluster_delta:
+        scale = 1.0 + cluster_delta["saturation"] * 0.1
+        lab[:, :, 1] *= scale
+        lab[:, :, 2] *= scale
+
+    if "vibrance" in cluster_delta and cluster_delta["vibrance"] != 0:
+        low_sat_mask = 1.0 - (s_ch / 255.0)
+        s_ch += cluster_delta["vibrance"] * low_sat_mask
+
+    if "temperature_est_k" in cluster_delta and cluster_delta["temperature_est_k"] != 0:
+        warmth = cluster_delta["temperature_est_k"] / 6500.0
+        b_ch += warmth * 2.0
+        a_ch -= warmth * 0.5
+    elif "temperature" in cluster_delta:
+        lab[:, :, 2] = np.clip(lab[:, :, 2] + cluster_delta["temperature"] * 5, 0, 255)
+
+    if "tint" in cluster_delta:
+        lab[:, :, 1] = np.clip(lab[:, :, 1] + cluster_delta["tint"] * 2, 0, 255)
+
+    lab[:, :, 0] = np.clip(l_ch, 0, 255)
+    lab[:, :, 1] = np.clip(a_ch, 0, 255)
+    lab[:, :, 2] = np.clip(b_ch, 0, 255)
+    hsv[:, :, 1] = np.clip(s_ch, 0, 255)
+
+    bgr_from_lab = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    hsv[:, :, 2] = np.clip(hsv[:, :, 2], 0, 255)
+    bgr_from_hsv = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+    blended = cv2.addWeighted(bgr_from_lab, 0.6, bgr_from_hsv, 0.4, 0)
+    return cv2.cvtColor(blended, cv2.COLOR_BGR2RGB)
 
 
 def process_image(
     image_path: str,
     control_profile: dict,
-    cluster_delta: dict = None,
+    cluster_delta: dict,
     control_bg_profile: dict = None,
-    clamp_pct: float = 0.10,
-    bg_strength: float = 0.85,
+    session_id: str = None,
+    image_id: str = None,
+    debug_mode: bool = False
 ) -> dict:
-    t0 = time.time()
+    """
+    AMD-01 corrected master processing function.
 
+    Pipeline:
+    1. Decode image to working RGB space
+    2. Run AMD-01 four-stage face pipeline (detect -> mesh -> masks -> serialize)
+    3. No face detected -> FLAGGED, export original as-is
+    4. Apply global correction to full image canvas
+    5. Apply face-region residual correction
+    6. Feather-blend using face_influence_alpha (no hard boundaries)
+    7. Apply skin luminance guard inside skin_core_alpha (+/-8% L* clamp)
+    8. Normalize background inside background_alpha
+    9. Cache masks if session context provided
+
+    Returns:
+        status          - CORRECTED | FLAGGED | ERROR
+        corrected_img   - np.ndarray (RGB uint8)
+        face_detected   - bool
+        mesh_success    - bool
+        confidence      - float
+        bbox            - tuple or None
+        face_zone_json  - str or None
+        face_zone_version - str or None
+        mask_cache_path - str or None
+        error_message   - str or None
+    """
     try:
-        img = Image.open(image_path).convert("RGB")
-        w, h = img.size
-    except Exception as e:
-        return {
-            "status": "ERROR",
-            "message": "Decode failed: %s" % str(e),
-            "image_path": image_path,
+        img_rgb = decode_image_to_rgb(image_path)
+
+        face_result = run_face_pipeline(img_rgb)
+
+        base_meta = {
+            "face_detected":    face_result["face_detected"],
+            "mesh_success":     face_result["mesh_success"],
+            "confidence":       face_result["confidence"],
+            "bbox":             face_result["bbox"],
+            "face_zone_json":   face_result["face_zone_json"],
+            "face_zone_version": "mediapipe_face_mesh_v1" if face_result["mesh_success"] else None,
+            "mask_cache_path":  None,
         }
 
-    try:
-        face_result = detect_face(image_path)
-    except Exception as e:
-        return {
-            "status": "ERROR",
-            "message": "Face detection failed: %s" % str(e),
-            "image_path": image_path,
-        }
+        if not face_result["face_detected"]:
+            return {
+                "status":         "FLAGGED",
+                "corrected_img":  img_rgb,
+                "error_message":  "No face detected — exported as-is",
+                **base_meta,
+            }
 
-    face_detected = face_result.get("detected", False)
-    if not face_detected:
-        return {
-            "status": "FLAGGED",
-            "message": "No face detected — skipping correction",
-            "reason": face_result.get("reason", "no_face_found"),
-            "image_path": image_path,
-            "face_detected": False,
-            "corrected_img": None,
-            "processing_time_ms": int((time.time() - t0) * 1000),
-        }
+        global_corrected = apply_global_correction(img_rgb, cluster_delta)
 
-    bbox = face_result["primary_face"]["bounding_box"]
+        if face_result["mesh_success"] and face_result["masks"]:
+            masks = face_result["masks"]
 
-    try:
-        src_profile = extract_profile(image_path)
-    except Exception as e:
-        return {
-            "status": "ERROR",
-            "message": "Profile extraction failed: %s" % str(e),
-            "image_path": image_path,
-        }
+            face_delta = {k: v * 0.3 for k, v in cluster_delta.items()}
+            face_corrected = apply_global_correction(img_rgb, face_delta)
 
-    try:
-        corrected = apply_correction(img, src_profile, control_profile)
-    except Exception as e:
-        return {
-            "status": "ERROR",
-            "message": "Correction failed: %s" % str(e),
-            "image_path": image_path,
-        }
+            blended = feather_blend(
+                global_corrected,
+                face_corrected,
+                masks["face_influence_alpha"]
+            )
 
-    skin_guard_applied = False
-    try:
-        corrected = apply_with_skin_guard(img, corrected, bbox, clamp_pct=clamp_pct)
-        skin_guard_applied = True
-    except Exception as e:
-        pass
+            guarded = apply_skin_guard(
+                img_rgb, blended,
+                masks["skin_core_alpha"],
+                clamp_pct=0.08
+            )
 
-    bg_normalized = False
-    if control_bg_profile:
-        try:
-            corrected = normalize_background(corrected, control_bg_profile, bbox, strength=bg_strength)
-            bg_normalized = True
-        except Exception as e:
-            pass
+            bg_profile = None
+            if control_bg_profile:
+                bg_profile = control_bg_profile
+            elif control_profile and "background" in control_profile:
+                bg_profile = control_profile["background"]
 
-    elapsed_ms = int((time.time() - t0) * 1000)
+            final = normalize_background(
+                guarded, bg_profile, masks["background_alpha"]
+            )
 
-    return {
-        "status": "OK",
-        "image_path": image_path,
-        "corrected_img": corrected,
-        "face_detected": True,
-        "face_count": face_result.get("face_count", 1),
-        "face_confidence": face_result["primary_face"]["confidence"],
-        "face_bbox": bbox,
-        "skin_guard_applied": skin_guard_applied,
-        "bg_normalized": bg_normalized,
-        "source_profile": src_profile,
-        "processing_time_ms": elapsed_ms,
-        "image_size": {"width": w, "height": h},
-    }
+            cache_path = None
+            if session_id and image_id:
+                cache_path = save_mask_cache(
+                    session_id, image_id,
+                    masks["skin_core_alpha"],
+                    masks["face_influence_alpha"],
+                    masks["background_alpha"]
+                )
 
+            base_meta["mask_cache_path"] = cache_path
 
-if __name__ == "__main__":
-    import os
-    import json
+            return {
+                "status":         "CORRECTED",
+                "corrected_img":  final,
+                "error_message":  None,
+                **base_meta,
+            }
 
-    control_path = "test_images/control.jpg"
-    control_profile = extract_profile(control_path)
-
-    control_img = Image.open(control_path).convert("RGB")
-    control_face = detect_face(control_path)
-    control_bb = control_face["primary_face"]["bounding_box"]
-    control_bg = extract_bg_profile(control_img, control_bb)
-
-    test_dir = "test_images/batch_input"
-    paths = sorted([
-        os.path.join(test_dir, f)
-        for f in os.listdir(test_dir)
-        if f.lower().endswith((".jpg", ".jpeg", ".png"))
-        and os.path.isfile(os.path.join(test_dir, f))
-    ])
-
-    out_dir = "test_images/pipeline_output"
-    os.makedirs(out_dir, exist_ok=True)
-
-    print("=== Full Correction Pipeline — %d images ===" % len(paths))
-    print()
-
-    ok = 0
-    flagged = 0
-    errors = 0
-
-    for path in paths:
-        name = os.path.basename(path)
-        result = process_image(
-            path,
-            control_profile,
-            control_bg_profile=control_bg,
-        )
-
-        status = result["status"]
-        ms = result.get("processing_time_ms", 0)
-
-        if status == "OK":
-            ok += 1
-            out_path = os.path.join(out_dir, name.rsplit(".", 1)[0] + ".jpg")
-            result["corrected_img"].save(out_path, "JPEG", quality=95)
-            print("[OK]      %s  (%dms)  face=%.2f  skin_guard=%s  bg_norm=%s" % (
-                name, ms,
-                result["face_confidence"],
-                result["skin_guard_applied"],
-                result["bg_normalized"],
-            ))
-        elif status == "FLAGGED":
-            flagged += 1
-            print("[FLAGGED] %s  (%dms)  reason=%s" % (name, ms, result.get("reason")))
         else:
-            errors += 1
-            print("[ERROR]   %s  — %s" % (name, result.get("message")))
+            return {
+                "status":         "FLAGGED",
+                "corrected_img":  global_corrected,
+                "error_message":  "Mesh failed — global correction applied, flagged for review",
+                **base_meta,
+            }
 
-    print()
-    print("=== Pipeline Complete ===")
-    print("OK: %d  |  Flagged: %d  |  Errors: %d  |  Total: %d" % (ok, flagged, errors, len(paths)))
-
-    out_files = sorted(os.listdir(out_dir))
-    print("Output folder: %d file(s)" % len(out_files))
-    for f in out_files:
-        size_kb = os.path.getsize(os.path.join(out_dir, f)) / 1024
-        print("  %s  (%.0f KB)" % (f, size_kb))
+    except Exception as e:
+        return {
+            "status":         "ERROR",
+            "corrected_img":  None,
+            "face_detected":  False,
+            "mesh_success":   False,
+            "confidence":     0.0,
+            "bbox":           None,
+            "face_zone_json": None,
+            "face_zone_version": None,
+            "mask_cache_path": None,
+            "error_message":  str(e),
+        }
